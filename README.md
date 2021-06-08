@@ -228,3 +228,231 @@ ggplot(sim_data) +
     geom_vline(xintercept=200) +
     theme_bw()
 ```
+
+# Cleaned Data From DOMO
+```{r, warning=F, message=F}
+# Pull Data from "Leads Conversion | Predictive Data Source"
+pred_data <-
+  domo$ds_query('71c9a7ae-ba0a-491b-83d3-4fbc9d5cdcb2',
+      'select * from table where label in (\'Converted\', \'Disqualified\')')
+
+head(pred_data[1:5,1:5])
+```
+
+# Function To Break The Data To Training and Testing
+```{r}
+preProcess_function <- function(x,y){
+  x <- x %>% filter(cohort == y)
+
+  set.seed(212)
+  partition <- createDataPartition(x$label, p = 0.7, list=FALSE) #70:30 prop
+  training <- x[partition, ] %>% mutate(type = 'training')
+  testing <- x[-partition, ] %>% mutate(type = 'testing')
+  x <- rbind(training, testing)[,-c(115:121, 202:224)] # Remove unnecessary cols
+
+  return(x)
+}
+```
+
+# Training Data to Push to DOMO for Static Reference
+```{r}
+apac_pred <- preProcess_function(pred_data, 'APAC')
+emea_mktg_pred <- preProcess_function(pred_data, 'EMEA Mktg')
+emea_sales_pred <- preProcess_function(pred_data, 'EMEA Sales')
+noa_mktg_pred <- preProcess_function(pred_data, 'NoA Mktg')
+noa_sales_pred <- preProcess_function(pred_data, 'NoA Sales')
+japan_pred <- preProcess_function(pred_data, 'Japan') 
+other_pred <- preProcess_function(pred_data, 'Other')
+
+all_pred <- rbind(apac_pred, emea_mktg_pred, emea_sales_pred, noa_mktg_pred,
+                  noa_sales_pred, japan_pred, other_pred)
+
+# Leads Conversion | Static Training Data
+# domo$ds_update('cd1e8033-3376-48d5-80c5-433f0f90ef76', all_pred)
+```
+
+# AutomML Result Data
+```{r}
+# Get data from "Leads Conversion | Predictive Results"
+data <- 
+  domo$ds_query('c1716b1a-975f-44c9-a6ba-704c32274246', 
+        'select * from table where label <> \'N/A\'')
+data <- data %>% rename(probability = `_probability_`)
+
+noa_mktg <- data %>% filter(cohort == 'NoA Mktg') %>% 
+  mutate(label = factor(label, levels = c('Converted', 'Disqualified')))
+
+noa_sales <- data %>% filter(cohort == 'NoA Sales') %>% 
+  mutate(label = factor(label, levels = c('Converted', 'Disqualified')))
+```
+
+# ROC
+NAM Marketing is reasonably not overfit.
+NAM Sales is reasonably not overfit.
+```{r}
+# Marketing
+colAUC(filter(noa_mktg, type == 'training')$probability, 
+       filter(noa_mktg, type == 'training')$label) # 0.8941
+
+colAUC(filter(noa_mktg, type == 'testing')$probability, 
+       filter(noa_mktg, type == 'testing')$label) # 0.87783
+
+
+# Sales
+colAUC(filter(noa_sales, type == 'training')$probability, 
+       filter(noa_sales, type == 'training')$label) # 0.83436
+
+colAUC(filter(noa_sales, type == 'testing')$probability, 
+       filter(noa_sales, type == 'testing')$label) #0.82701
+```
+
+# Cutoff Function
+```{r}
+cutoff_function <- function(x,y,z){
+  x <- x %>% filter(type == y & label == 'Converted' & cohort == z) %>% 
+    select(cohort, label, lead_id, probability) %>% arrange(probability)
+  x <- x[1:5, ]
+  return(x)
+}
+```
+
+# Cutoffs
+```{r}
+cutoff_function(data, 'testing', 'APAC') # 0.000027271
+cutoff_function(data, 'testing', 'Japan') # 0.30407
+cutoff_function(data, 'testing', 'NoA Mktg') # 0.083415
+cutoff_function(data, 'testing', 'NoA Sales') # 0.12039
+cutoff_function(data, 'testing', 'EMEA Mktg') # 0.16016	
+cutoff_function(data, 'testing', 'EMEA Sales') # 0.0017171
+cutoff_function(data, 'testing', 'Other') # 0.056997
+```
+
+# Confusion Matrix Function
+```{r}
+conf_function <- function(x,y,z){
+  x <- x %>% filter(type == y)
+  
+  pred <- ifelse(x$probability >= z, 'Converted', 'Disqualified') %>% 
+    factor(levels = c('Converted', 'Disqualified'))
+  
+  ref <- x$label
+  
+  return(
+    confusionMatrix(pred, ref, positive = 'Converted')
+    )
+}
+```
+
+# Cutoffs
+```{r}
+# Marketing
+filter(noa_mktg, type == 'testing') %>% 
+  select(label, lead_id, probability) %>% arrange(probability) # 0.07957285
+
+conf_function(noa_mktg, 'testing', 0.07957284)
+filter(noa_mktg, type == 'testing') %>% nrow()
+
+# Sales
+filter(noa_sales, type == 'testing' & label == 'Converted') %>% 
+  select(label, lead_id, probability) %>% arrange(probability) # 0.1206277
+
+conf_function(noa_sales, 'testing', 0.1206277)
+filter(noa_sales, type == 'testing') %>% nrow()
+
+# Combined
+conf_function(rbind(noa_sales, noa_mktg), 'testing', 0.5)
+
+noa_mktg %>% filter(type == 'testing' & label == 'Converted') %>% 
+  arrange(probability) %>% select(label, probability) %>% view()
+
+noa_sales %>% filter(type == 'testing' & label == 'Converted') %>% 
+  arrange(probability) %>% select(label, probability) %>% view()
+```
+
+
+# Web and Email Data
+```{r}
+web_email_data <- rbind(noa_sales, noa_mktg) %>%   
+  select(label, web_click_count, web_visit_count, email_open_count,
+         mql_web_click_count, mql_web_visit_count, mql_email_open_count,
+         mql_email_click_count, type)
+
+set.seed(212)
+registerDoSNOW(cl)
+glm_model <- train(label ~.,
+                   filter(web_email_data, type == 'training')[,-9],
+                   method = 'glm',
+                   metric = 'ROC',
+                   trControl = trainControl(
+                     method = 'cv',
+                     number = 10,
+                     summaryFunction = twoClassSummary,
+                     classProbs = T,
+                     verboseIter = T))
+
+p <- predict(glm_model, web_email_data, type = 'prob')['Converted']
+web_email_data$probability <- p$Converted
+
+conf_function(web_email_data, 'testing', 0.5)
+```
+
+# Web & Email Data vs Target Variable
+```{r}
+# Marketing Correlations
+mktg_cor <- filter(noa_mktg, type == 'testing') %>%   
+  select(mql_web_click_count, mql_web_visit_count, mql_email_open_count,
+         mql_email_click_count, web_click_count, web_visit_count, email_open_count,
+         email_click_count,probability) %>% cor() %>% data.frame() %>% 
+  rownames_to_column() %>% mutate(type = 'Mktg') %>% pivot_longer(cols = 2:10) %>% 
+  filter(rowname != name & rowname == 'probability') %>% arrange(desc(value))
+
+# Sales Correlations
+sales_cor <- filter(noa_sales, type == 'testing') %>%   
+  select(mql_web_click_count, mql_web_visit_count, mql_email_open_count,
+         mql_email_click_count, web_click_count, web_visit_count, email_open_count,
+         email_click_count,probability) %>% cor() %>% data.frame() %>% 
+  rownames_to_column() %>% mutate(type = 'Sales') %>% pivot_longer(cols = 2:10) %>% 
+  filter(rowname != name & rowname == 'probability') %>% arrange(desc(value))
+
+# domo$ds_update("5e91c7f4-ed3a-4d5c-b7c7-d65647366a33", rbind(mktg_cor, sales_cor))
+```
+
+# Variable's Relationship with the Target Variable
+```{r}
+# Marketing
+varimp_mktg <- 
+  domo$ds_get('7176a0e2-247b-4bae-9aba-c6e7a3ce163b') # Varimp from AutoML
+
+var_mktg <- 
+  noa_mktg %>% 
+  pivot_longer(cols = c(10:202), names_to = 'variable', values_to = 'value') %>% 
+  filter(value <=1 & type == 'testing') %>% group_by(variable, value) %>% 
+  summarise(avg_prob = mean(probability))
+
+var_mktg_1 <- 
+  filter(var_mktg, value == 1) %>% 
+  inner_join(filter(var_mktg, value == 0), by = c("variable"="variable")) %>% 
+  inner_join(varimp_mktg, by = c("variable"="Column name")) %>% 
+  mutate(prob_diff = avg_prob.x - avg_prob.y) %>% 
+  arrange(desc(`Feature Importance Value`)) %>% filter(prob_diff < 0)
+
+write.csv(var_mktg_1, 'Variable Importance.csv')
+
+# Sales
+varimp_sales <- 
+  domo$ds_get('9f9ea756-adc8-4f3e-acd1-ce866e5ad847') # Varimp from AutoML
+
+var_sales <- 
+  noa_sales %>% 
+  pivot_longer(cols = 10:202, names_to = 'variable', values_to = 'value') %>% 
+  filter(value <=1 & type == 'testing') %>% group_by(variable, value) %>% 
+  summarise(avg_prob = mean(probability))
+
+var_sales_1 <- 
+  filter(var_sales, value == 1) %>% 
+  inner_join(filter(var_sales, value == 0), by = c("variable"="variable")) %>% 
+  inner_join(varimp_sales, by = c("variable"="Column name")) %>% 
+  mutate(prob_diff = avg_prob.x - avg_prob.y) %>% 
+  arrange(desc(`Feature Importance Value`))
+```
+
